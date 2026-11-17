@@ -1,18 +1,18 @@
 #include "shell.h"
+
 #include <ctype.h>
+#include <limits.h>
 
 
-// Expand !n into the previously stored command
+// Expand !n into a previous command
 int expand_history(char** cmdline) {
 
-    // Only process commands starting with !
     if ((*cmdline)[0] != '!') {
         return 1;
     }
 
     char* number_text = *cmdline + 1;
 
-    // Check that a number follows !
     if (!isdigit((unsigned char)number_text[0])) {
 
         fprintf(stderr, "history: invalid command\n");
@@ -26,20 +26,22 @@ int expand_history(char** cmdline) {
 
     unsigned long number = strtoul(number_text, &end, 10);
 
-    // Allow trailing spaces, but no other characters
     while (isspace((unsigned char)*end)) {
         end++;
     }
 
-    if (errno == ERANGE || *end != '\0' || number == 0) {
+    if (errno == ERANGE ||
+        *end != '\0' ||
+        number == 0 ||
+        number > INT_MAX) {
 
         fprintf(stderr, "history: invalid command number\n");
 
         return 0;
     }
 
-    // Retrieve the requested command
-    const char* previous = get_history_command(number);
+    // Retrieve command from GNU Readline history
+    HIST_ENTRY* previous = history_get((int)number);
 
     if (previous == NULL) {
 
@@ -48,15 +50,12 @@ int expand_history(char** cmdline) {
         return 0;
     }
 
-    // Create a copy before replacing the original command line
-    char* replacement = malloc(strlen(previous) + 1);
+    char* replacement = strdup(previous->line);
 
     if (replacement == NULL) {
-        perror("malloc");
+        perror("strdup");
         return 0;
     }
-
-    strcpy(replacement, previous);
 
     free(*cmdline);
 
@@ -75,12 +74,16 @@ int main() {
     int builtin_status;
 
 
-    while ((cmdline = read_cmd(PROMPT, stdin)) != NULL) {
+    // Enable command and filename completion
+    rl_attempted_completion_function = shell_completion;
+
+
+    while ((cmdline = readline(PROMPT)) != NULL) {
 
         builtin_status = 0;
 
 
-        // STEP 1: Expand !n before storing or tokenizing
+        // Expand !n before adding the command to history
         if (!expand_history(&cmdline)) {
 
             free(cmdline);
@@ -89,30 +92,30 @@ int main() {
         }
 
 
-        // STEP 2: Store the actual command in history
-        add_history(cmdline);
+        // Store non-empty commands in Readline history
+        if (cmdline[0] != '\0') {
+            add_history(cmdline);
+        }
 
 
-        // STEP 3: Tokenize the command
+        // Tokenize command
         arglist = tokenize(cmdline);
 
 
         if (arglist != NULL) {
 
-            // STEP 4: Check built-in commands
+            // Check built-in commands
             builtin_status = handle_builtin(arglist);
 
 
-            // STEP 5: Execute external commands
+            // Execute external commands
             if (builtin_status == 0) {
-
                 execute(arglist);
             }
 
 
             // Free tokenized arguments
             for (int i = 0; arglist[i] != NULL; i++) {
-
                 free(arglist[i]);
             }
 
@@ -123,9 +126,7 @@ int main() {
         free(cmdline);
 
 
-        // STEP 6: Exit the shell if exit was entered
         if (builtin_status == 2) {
-
             break;
         }
     }
