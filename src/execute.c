@@ -1,4 +1,3 @@
-
 #include "shell.h"
 
 #include <fcntl.h>
@@ -6,6 +5,120 @@
 
 #define MAX_COMMANDS 10
 #define MAX_TOKENS 256
+#define MAX_JOBS 128
+
+
+// Structure for one command in a pipeline
+typedef struct {
+    char* args[MAXARGS + 1];
+    char* input_file;
+    char* output_file;
+    int argc;
+} Command;
+
+
+// Structure for one background job
+typedef struct {
+    pid_t pid;
+    char command[MAX_LEN];
+} BackgroundJob;
+
+
+// List of active background jobs
+static BackgroundJob background_jobs[MAX_JOBS];
+static int background_job_count = 0;
+
+
+// Remove a completed process from the active jobs list
+static void remove_background_job(pid_t pid) {
+
+    for (int i = 0; i < background_job_count; i++) {
+
+        if (background_jobs[i].pid == pid) {
+
+            for (int j = i; j < background_job_count - 1; j++) {
+                background_jobs[j] = background_jobs[j + 1];
+            }
+
+            background_job_count--;
+            return;
+        }
+    }
+}
+
+
+// Add a process to the active jobs list
+static int add_background_job(pid_t pid, const char* command) {
+
+    if (background_job_count >= MAX_JOBS) {
+        fprintf(stderr, "Maximum background jobs reached.\n");
+        return -1;
+    }
+
+    background_jobs[background_job_count].pid = pid;
+
+    snprintf(
+        background_jobs[background_job_count].command,
+        MAX_LEN,
+        "%s",
+        command
+    );
+
+    background_job_count++;
+    return 0;
+}
+
+
+// Display active background jobs
+static void print_background_jobs(void) {
+
+    if (background_job_count == 0) {
+        printf("No background jobs.\n");
+        return;
+    }
+
+    for (int i = 0; i < background_job_count; i++) {
+
+        printf(
+            "[%d] PID %ld %s\n",
+            i + 1,
+            (long)background_jobs[i].pid,
+            background_jobs[i].command
+        );
+    }
+}
+
+
+// Reap completed background processes without blocking
+void reap_background_jobs(void) {
+
+    int status;
+    pid_t pid;
+
+    while (1) {
+
+        pid = waitpid(-1, &status, WNOHANG);
+
+        if (pid > 0) {
+
+            remove_background_job(pid);
+
+            printf(
+                "\n[completed] PID %ld\n",
+                (long)pid
+            );
+
+            continue;
+        }
+
+        if (pid == -1 && errno == EINTR) {
+            continue;
+        }
+
+        break;
+    }
+}
+
 
 // Built-in commands
 int handle_builtin(char** arglist) {
@@ -50,7 +163,7 @@ int handle_builtin(char** arglist) {
         printf("  exit              - Exit the shell\n");
         printf("  cd <directory>    - Change current directory\n");
         printf("  help              - Display this help message\n");
-        printf("  jobs              - Display background jobs status\n");
+        printf("  jobs              - Display active background jobs\n");
         printf("  history           - Display command history\n\n");
 
         return 1;
@@ -58,7 +171,11 @@ int handle_builtin(char** arglist) {
 
     // JOBS
     if (strcmp(arglist[0], "jobs") == 0) {
-        printf("Job control not yet implemented.\n");
+
+        // Refresh the list before displaying it
+        reap_background_jobs();
+        print_background_jobs();
+
         return 1;
     }
 
@@ -87,15 +204,6 @@ void print_history(void) {
 }
 
 
-// Data structure for one command
-typedef struct {
-    char* args[MAXARGS + 1];
-    char* input_file;
-    char* output_file;
-    int argc;
-} Command;
-
-
 // Split a line into words and operators.
 // Supports single and double quoted arguments.
 static int parse_tokens(char* line, char* tokens[]) {
@@ -119,7 +227,7 @@ static int parse_tokens(char* line, char* tokens[]) {
         }
 
         // Operators are separate tokens, even without spaces
-        if (*p == '|' || *p == '<' || *p == '>') {
+        if (*p == '|' || *p == '<' || *p == '>' || *p == '&') {
 
             char operator_token[2] = {*p, '\0'};
             tokens[count] = strdup(operator_token);
@@ -157,7 +265,7 @@ static int parse_tokens(char* line, char* tokens[]) {
             else {
 
                 if (isspace((unsigned char)*p) ||
-                    *p == '|' || *p == '<' || *p == '>') {
+                    *p == '|' || *p == '<' || *p == '>' || *p == '&') {
                     break;
                 }
             }
@@ -246,6 +354,7 @@ static int parse_commands(
                 strcmp(tokens[i + 1], "|") == 0 ||
                 strcmp(tokens[i + 1], "<") == 0 ||
                 strcmp(tokens[i + 1], ">") == 0 ||
+                strcmp(tokens[i + 1], "&") == 0 ||
                 commands[current].input_file != NULL) {
 
                 fprintf(stderr, "Syntax error with input redirection\n");
@@ -263,6 +372,7 @@ static int parse_commands(
                 strcmp(tokens[i + 1], "|") == 0 ||
                 strcmp(tokens[i + 1], "<") == 0 ||
                 strcmp(tokens[i + 1], ">") == 0 ||
+                strcmp(tokens[i + 1], "&") == 0 ||
                 commands[current].output_file != NULL) {
 
                 fprintf(stderr, "Syntax error with output redirection\n");
@@ -280,7 +390,6 @@ static int parse_commands(
         }
 
         commands[current].args[commands[current].argc++] = tokens[i];
-
         commands[current].args[commands[current].argc] = NULL;
     }
 
@@ -293,8 +402,13 @@ static int parse_commands(
 }
 
 
-// Execute a pipeline with optional redirection
-static int execute_pipeline(Command commands[], int command_count) {
+// Execute a pipeline with optional redirection and background mode
+static int execute_pipeline(
+    Command commands[],
+    int command_count,
+    int background,
+    const char* job_command
+) {
 
     int pipes[MAX_COMMANDS - 1][2];
     pid_t pids[MAX_COMMANDS];
@@ -331,7 +445,9 @@ static int execute_pipeline(Command commands[], int command_count) {
 
             // Wait for children already started
             for (int j = 0; j < i; j++) {
-                waitpid(pids[j], NULL, 0);
+                while (waitpid(pids[j], NULL, 0) == -1 && errno == EINTR) {
+                    // Retry if interrupted
+                }
             }
 
             return -1;
@@ -418,19 +534,47 @@ static int execute_pipeline(Command commands[], int command_count) {
         close(pipes[i][1]);
     }
 
-    // Wait for all child processes
-    int status = 0;
+    // Background execution: register children and return immediately
+    if (background) {
 
+        for (int i = 0; i < command_count; i++) {
+
+            if (add_background_job(pids[i], job_command) == 0) {
+
+                printf("[background] PID %ld\n", (long)pids[i]);
+            }
+            else {
+
+                // If the job list is full, wait for this child
+                while (waitpid(pids[i], NULL, 0) == -1 && errno == EINTR) {
+                    // Retry if interrupted
+                }
+            }
+        }
+
+        return 0;
+    }
+
+    // Foreground execution: wait for every child
     for (int i = 0; i < command_count; i++) {
-        waitpid(pids[i], &status, 0);
+
+        while (waitpid(pids[i], NULL, 0) == -1) {
+
+            if (errno == EINTR) {
+                continue;
+            }
+
+            perror("waitpid");
+            break;
+        }
     }
 
     return 0;
 }
 
 
-// Main entry point for command execution
-int execute_line(char* line) {
+// Execute one command, including its pipeline and redirection
+static int execute_single_command(char* line) {
 
     char* tokens[MAX_TOKENS];
 
@@ -440,10 +584,39 @@ int execute_line(char* line) {
         return 0;
     }
 
-    Command commands[MAX_COMMANDS];
+    // Detect background execution (&)
+    int background = 0;
 
+    for (int i = 0; i < token_count; i++) {
+
+        if (strcmp(tokens[i], "&") == 0) {
+
+            // Ampersand is allowed only at the end
+            if (i != token_count - 1) {
+
+                fprintf(stderr, "Syntax error: & must be at the end\n");
+                free_tokens(tokens, token_count);
+                return 0;
+            }
+
+            background = 1;
+
+            free(tokens[i]);
+            token_count--;
+
+            break;
+        }
+    }
+
+    if (token_count == 0) {
+        fprintf(stderr, "Syntax error: missing command\n");
+        return 0;
+    }
+
+    Command commands[MAX_COMMANDS];
     int command_count = 0;
 
+    // Parse commands into pipeline segments
     if (parse_commands(
             tokens,
             token_count,
@@ -457,9 +630,9 @@ int execute_line(char* line) {
 
     int result = 0;
 
-    // A built-in runs in the shell process only when it is a
-    // standalone command without redirection.
-    if (command_count == 1 &&
+    // Built-ins execute in the parent shell when run in foreground
+    if (!background &&
+        command_count == 1 &&
         commands[0].input_file == NULL &&
         commands[0].output_file == NULL) {
 
@@ -471,9 +644,77 @@ int execute_line(char* line) {
         }
     }
 
-    execute_pipeline(commands, command_count);
+    // Execute foreground or background pipeline
+    execute_pipeline(
+        commands,
+        command_count,
+        background,
+        line
+    );
 
     free_tokens(tokens, token_count);
+    return 0;
+}
+
+
+// Main entry point: split and execute semicolon-separated commands
+int execute_line(char* line) {
+
+    char* start = line;
+    char quote = '\0';
+    int result = 0;
+
+    for (char* p = line; ; p++) {
+
+        // A semicolon separates commands only outside quotes
+        if (*p == '\0' || (*p == ';' && quote == '\0')) {
+
+            char delimiter = *p;
+            *p = '\0';
+
+            // Remove leading whitespace
+            while (isspace((unsigned char)*start)) {
+                start++;
+            }
+
+            // Remove trailing whitespace
+            char* end = start + strlen(start);
+
+            while (end > start && isspace((unsigned char)end[-1])) {
+                *--end = '\0';
+            }
+
+            // Execute non-empty command
+            if (*start != '\0') {
+
+                result = execute_single_command(start);
+
+                // Stop processing the line if exit was entered
+                if (result == 2) {
+                    return 2;
+                }
+            }
+
+            if (delimiter == '\0') {
+                break;
+            }
+
+            start = p + 1;
+            continue;
+        }
+
+        // Track quoted sections so semicolons inside quotes are ignored
+        if (quote != '\0') {
+
+            if (*p == quote) {
+                quote = '\0';
+            }
+        }
+        else if (*p == '\'' || *p == '"') {
+
+            quote = *p;
+        }
+    }
 
     return 0;
 }

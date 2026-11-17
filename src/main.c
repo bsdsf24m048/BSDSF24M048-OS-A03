@@ -1,4 +1,3 @@
-
 #include "shell.h"
 
 #include <ctype.h>
@@ -67,7 +66,17 @@ int main(void) {
     // Enable command and filename completion
     rl_attempted_completion_function = shell_completion;
 
-    while ((cmdline = readline(PROMPT)) != NULL) {
+    while (1) {
+
+        // Reap completed background processes before each prompt
+        reap_background_jobs();
+
+        // Display prompt and read next command
+        cmdline = readline(PROMPT);
+
+        if (cmdline == NULL) {
+            break;
+        }
 
         builtin_status = 0;
 
