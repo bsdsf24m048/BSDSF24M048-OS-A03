@@ -28,4 +28,7 @@ void print_history(void);
 char** shell_completion(const char* text, int start, int end);
 
 int execute_line(char* line);
+
+void reap_background_jobs(void);
+
 #endif
