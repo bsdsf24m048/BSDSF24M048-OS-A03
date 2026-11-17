@@ -1,3 +1,4 @@
+
 #include "shell.h"
 
 #include <ctype.h>
@@ -14,9 +15,7 @@ int expand_history(char** cmdline) {
     char* number_text = *cmdline + 1;
 
     if (!isdigit((unsigned char)number_text[0])) {
-
         fprintf(stderr, "history: invalid command\n");
-
         return 0;
     }
 
@@ -36,17 +35,13 @@ int expand_history(char** cmdline) {
         number > INT_MAX) {
 
         fprintf(stderr, "history: invalid command number\n");
-
         return 0;
     }
 
-    // Retrieve command from GNU Readline history
     HIST_ENTRY* previous = history_get((int)number);
 
     if (previous == NULL) {
-
         fprintf(stderr, "history: command not found\n");
-
         return 0;
     }
 
@@ -58,79 +53,44 @@ int expand_history(char** cmdline) {
     }
 
     free(*cmdline);
-
     *cmdline = replacement;
 
     return 1;
 }
 
 
-
-int main() {
+int main(void) {
 
     char* cmdline;
-    char** arglist;
-
     int builtin_status;
-
 
     // Enable command and filename completion
     rl_attempted_completion_function = shell_completion;
-
 
     while ((cmdline = readline(PROMPT)) != NULL) {
 
         builtin_status = 0;
 
-
-        // Expand !n before adding the command to history
+        // Expand !n before adding to history
         if (!expand_history(&cmdline)) {
-
             free(cmdline);
-
             continue;
         }
 
-
-        // Store non-empty commands in Readline history
+        // Add non-empty commands to Readline history
         if (cmdline[0] != '\0') {
             add_history(cmdline);
         }
 
-
-        // Tokenize command
-        arglist = tokenize(cmdline);
-
-
-        if (arglist != NULL) {
-
-            // Check built-in commands
-            builtin_status = handle_builtin(arglist);
-
-
-            // Execute external commands
-            if (builtin_status == 0) {
-                execute(arglist);
-            }
-
-
-            // Free tokenized arguments
-            for (int i = 0; arglist[i] != NULL; i++) {
-                free(arglist[i]);
-            }
-
-            free(arglist);
-        }
-
+        // Parse and execute the full command line
+        builtin_status = execute_line(cmdline);
 
         free(cmdline);
-
 
         if (builtin_status == 2) {
             break;
         }
     }
-
 
     printf("\nShell exited.\n");
 
