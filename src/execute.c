@@ -25,6 +25,7 @@ int handle_builtin(char** arglist) {
         }
 
         else if (arglist[2] != NULL) {
+
             fprintf(stderr, "cd: too many arguments\n");
             return 1;
         }
@@ -73,8 +74,28 @@ int handle_builtin(char** arglist) {
     }
 
 
-    // Not a built-in command
     return 0;
+}
+
+
+
+// Display Readline history
+void print_history(void) {
+
+    HIST_ENTRY** entries = history_list();
+
+    if (entries == NULL) {
+        return;
+    }
+
+    for (int i = 0; entries[i] != NULL; i++) {
+
+        printf(
+            "%d  %s\n",
+            history_base + i,
+            entries[i]->line
+        );
+    }
 }
 
 
@@ -92,16 +113,16 @@ int execute(char* arglist[]) {
             perror("fork failed");
             return -1;
 
-
         case 0:
+
             execvp(arglist[0], arglist);
 
             perror("Command not found");
 
             exit(EXIT_FAILURE);
 
-
         default:
+
             waitpid(cpid, &status, 0);
 
             return 0;

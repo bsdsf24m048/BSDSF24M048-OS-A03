@@ -1,33 +1,40 @@
 #include "shell.h"
 
-char* read_cmd(char* prompt, FILE* fp) {
-    printf("%s", prompt);
-    char* cmdline = (char*) malloc(sizeof(char) * MAX_LEN);
-    int c, pos = 0;
+#include <dirent.h>
+#include <sys/stat.h>
+#include <limits.h>
 
-    while ((c = getc(fp)) != EOF) {
-        if (c == '\n') break;
-        cmdline[pos++] = c;
-    }
 
-    if (c == EOF && pos == 0) {
-        free(cmdline);
-        return NULL; // Handle Ctrl+D
-    }
-    
-    cmdline[pos] = '\0';
-    return cmdline;
-}
-
+// Tokenize the command line
 char** tokenize(char* cmdline) {
-    // Edge case: empty command line
-    if (cmdline == NULL || cmdline[0] == '\0' || cmdline[0] == '\n') {
+
+    if (cmdline == NULL || cmdline[0] == '\0' ||
+        cmdline[0] == '\n') {
         return NULL;
     }
 
-    char** arglist = (char**)malloc(sizeof(char*) * (MAXARGS + 1));
+    char** arglist = malloc(sizeof(char*) * (MAXARGS + 1));
+
+    if (arglist == NULL) {
+        perror("malloc");
+        return NULL;
+    }
+
     for (int i = 0; i < MAXARGS + 1; i++) {
-        arglist[i] = (char*)malloc(sizeof(char) * ARGLEN);
+
+        arglist[i] = malloc(sizeof(char) * ARGLEN);
+
+        if (arglist[i] == NULL) {
+            perror("malloc");
+
+            for (int j = 0; j < i; j++) {
+                free(arglist[j]);
+            }
+
+            free(arglist);
+            return NULL;
+        }
+
         bzero(arglist[i], ARGLEN);
     }
 
@@ -37,128 +44,239 @@ char** tokenize(char* cmdline) {
     int argnum = 0;
 
     while (*cp != '\0' && argnum < MAXARGS) {
-        while (*cp == ' ' || *cp == '\t') cp++; // Skip leading whitespace
-        
-        if (*cp == '\0') break; // Line was only whitespace
+
+        while (*cp == ' ' || *cp == '\t') {
+            cp++;
+        }
+
+        if (*cp == '\0') {
+            break;
+        }
 
         start = cp;
         len = 1;
+
         while (*++cp != '\0' && !(*cp == ' ' || *cp == '\t')) {
             len++;
         }
+
+        if (len >= ARGLEN) {
+            fprintf(stderr, "Argument too long\n");
+
+            for (int i = 0; i < MAXARGS + 1; i++) {
+                free(arglist[i]);
+            }
+
+            free(arglist);
+            return NULL;
+        }
+
         strncpy(arglist[argnum], start, len);
         arglist[argnum][len] = '\0';
+
         argnum++;
     }
 
-    if (argnum == 0) { // No arguments were parsed
-        for(int i = 0; i < MAXARGS + 1; i++) free(arglist[i]);
+    if (argnum == 0) {
+
+        for (int i = 0; i < MAXARGS + 1; i++) {
+            free(arglist[i]);
+        }
+
         free(arglist);
         return NULL;
     }
 
     arglist[argnum] = NULL;
+
     return arglist;
 }
 
 
-// Command history storage
-static char* command_history[HISTORY_SIZE] = {NULL};
-static unsigned long history_count = 0;
+
+// Command completion generator
+static char* command_generator(const char* text, int state) {
+
+    static char* path_copy = NULL;
+    static char* path_cursor = NULL;
+
+    static DIR* directory = NULL;
+
+    static int builtin_index = 0;
+
+    const char* builtins[] = {
+        "cd",
+        "exit",
+        "help",
+        "jobs",
+        "history"
+    };
+
+    size_t text_length = strlen(text);
 
 
-// Add a command to history
-void add_history(const char* command) {
+    // Initialize when a new completion request starts
+    if (state == 0) {
 
-    // Ignore empty or whitespace-only commands
-    if (command == NULL || command[0] == '\0') {
-        return;
+        if (directory != NULL) {
+            closedir(directory);
+            directory = NULL;
+        }
+
+        free(path_copy);
+
+        const char* path = getenv("PATH");
+
+        path_copy = strdup(path != NULL ? path : "");
+
+        if (path_copy == NULL) {
+            return NULL;
+        }
+
+        path_cursor = path_copy;
+
+        builtin_index = 0;
     }
 
-    int only_spaces = 1;
 
-    for (int i = 0; command[i] != '\0'; i++) {
-        if (command[i] != ' ' && command[i] != '\t') {
-            only_spaces = 0;
-            break;
+    // Complete built-in commands
+    while (builtin_index < 5) {
+
+        const char* name = builtins[builtin_index++];
+
+        if (strncmp(name, text, text_length) == 0) {
+            return strdup(name);
         }
     }
 
-    if (only_spaces) {
-        return;
+
+    // Complete external commands from PATH
+    while (1) {
+
+        if (directory == NULL) {
+
+            if (path_cursor == NULL) {
+                return NULL;
+            }
+
+            char* current_path = path_cursor;
+
+            char* separator = strchr(path_cursor, ':');
+
+            if (separator != NULL) {
+
+                *separator = '\0';
+                path_cursor = separator + 1;
+            }
+            else {
+                path_cursor = NULL;
+            }
+
+            // An empty PATH component means current directory
+            if (current_path[0] == '\0') {
+                current_path = ".";
+            }
+
+            directory = opendir(current_path);
+
+            if (directory == NULL) {
+                continue;
+            }
+        }
+
+
+        struct dirent* entry;
+
+        while ((entry = readdir(directory)) != NULL) {
+
+            if (strncmp(entry->d_name, text, text_length) != 0) {
+                continue;
+            }
+
+            char full_path[PATH_MAX];
+
+            int result = snprintf(
+                full_path,
+                sizeof(full_path),
+                "%s/%s",
+                directory == NULL ? "." : ".",
+                entry->d_name
+            );
+
+            (void)result;
+
+            // Check executable using the current PATH directory
+            // Search each PATH entry directly
+            char* search_path = getenv("PATH");
+
+            if (search_path == NULL) {
+                continue;
+            }
+
+            // Check whether the command is executable
+            char* path_copy_check = strdup(search_path);
+
+            if (path_copy_check == NULL) {
+                continue;
+            }
+
+            char* saveptr = NULL;
+
+            for (char* part = strtok_r(path_copy_check, ":", &saveptr);
+                 part != NULL;
+                 part = strtok_r(NULL, ":", &saveptr)) {
+
+                if (part[0] == '\0') {
+                    part = ".";
+                }
+
+                snprintf(
+                    full_path,
+                    sizeof(full_path),
+                    "%s/%s",
+                    part,
+                    entry->d_name
+                );
+
+                if (access(full_path, X_OK) == 0) {
+
+                    free(path_copy_check);
+
+                    return strdup(entry->d_name);
+                }
+            }
+
+            free(path_copy_check);
+        }
+
+        closedir(directory);
+        directory = NULL;
     }
-
-    // Allocate memory for the command
-    char* copy = malloc(strlen(command) + 1);
-
-    if (copy == NULL) {
-        perror("history");
-        return;
-    }
-
-    strcpy(copy, command);
-
-    // Calculate the circular array position
-    unsigned long index = history_count % HISTORY_SIZE;
-
-    // Free the oldest command if this position is occupied
-    free(command_history[index]);
-
-    command_history[index] = copy;
-
-    history_count++;
 }
 
 
-// Display all stored commands
-void print_history(void) {
 
-    unsigned long first;
+// Readline completion callback
+char** shell_completion(const char* text, int start, int end) {
 
-    if (history_count > HISTORY_SIZE) {
-        first = history_count - HISTORY_SIZE + 1;
-    }
-    else {
-        first = 1;
-    }
+    (void)end;
 
-    printf("\n");
-
-    for (unsigned long i = first; i <= history_count; i++) {
-
-        unsigned long index = (i - 1) % HISTORY_SIZE;
-
-        printf("%lu  %s\n", i, command_history[index]);
+    // If a command contains a slash, complete it as a filename
+    if (strchr(text, '/') != NULL) {
+        return rl_completion_matches(
+            text,
+            rl_filename_completion_function
+        );
     }
 
-    printf("\n");
-}
-
-
-// Retrieve a command using its history number
-const char* get_history_command(unsigned long number) {
-
-    // Check whether the requested number exists
-    if (number == 0 || number > history_count) {
-        return NULL;
+    // First word: complete command names
+    if (start == 0) {
+        return rl_completion_matches(text, command_generator);
     }
 
-    // Find the oldest command still available
-    unsigned long first;
-
-    if (history_count > HISTORY_SIZE) {
-        first = history_count - HISTORY_SIZE + 1;
-    }
-    else {
-        first = 1;
-    }
-
-    // Requested command has already been overwritten
-    if (number < first) {
-        return NULL;
-    }
-
-    unsigned long index = (number - 1) % HISTORY_SIZE;
-
-    return command_history[index];
+    // Remaining words: complete filenames
+    return rl_completion_matches(
+        text,
+        rl_filename_completion_function
+    );
 }
