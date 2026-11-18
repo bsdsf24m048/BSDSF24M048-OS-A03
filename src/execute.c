@@ -29,6 +29,16 @@ static BackgroundJob background_jobs[MAX_JOBS];
 static int background_job_count = 0;
 
 
+// Exit status of the most recent foreground command
+static int last_exit_status = 0;
+
+
+// Return the exit status of the most recently executed foreground command
+int get_last_exit_status(void) {
+    return last_exit_status;
+}
+
+
 // Remove a completed process from the active jobs list
 static void remove_background_job(pid_t pid) {
 
@@ -138,11 +148,13 @@ int handle_builtin(char** arglist) {
 
             if (directory == NULL) {
                 fprintf(stderr, "cd: HOME not set\n");
+                last_exit_status = 1;
                 return 1;
             }
         }
         else if (arglist[2] != NULL) {
             fprintf(stderr, "cd: too many arguments\n");
+            last_exit_status = 1;
             return 1;
         }
         else {
@@ -151,6 +163,10 @@ int handle_builtin(char** arglist) {
 
         if (chdir(directory) != 0) {
             perror("cd");
+            last_exit_status = 1;
+        }
+        else {
+            last_exit_status = 0;
         }
 
         return 1;
@@ -164,8 +180,16 @@ int handle_builtin(char** arglist) {
         printf("  cd <directory>    - Change current directory\n");
         printf("  help              - Display this help message\n");
         printf("  jobs              - Display active background jobs\n");
-        printf("  history           - Display command history\n\n");
+        printf("  history           - Display command history\n");
+        printf("\nControl structure:\n");
+        printf("  if <command>\n");
+        printf("  then\n");
+        printf("    <commands>\n");
+        printf("  else              (optional)\n");
+        printf("    <commands>\n");
+        printf("  fi\n\n");
 
+        last_exit_status = 0;
         return 1;
     }
 
@@ -176,12 +200,14 @@ int handle_builtin(char** arglist) {
         reap_background_jobs();
         print_background_jobs();
 
+        last_exit_status = 0;
         return 1;
     }
 
     // HISTORY
     if (strcmp(arglist[0], "history") == 0) {
         print_history();
+        last_exit_status = 0;
         return 1;
     }
 
@@ -424,6 +450,7 @@ static int execute_pipeline(
                 close(pipes[j][1]);
             }
 
+            last_exit_status = 1;
             return -1;
         }
     }
@@ -450,6 +477,7 @@ static int execute_pipeline(
                 }
             }
 
+            last_exit_status = 1;
             return -1;
         }
 
@@ -521,8 +549,9 @@ static int execute_pipeline(
 
             execvp(commands[i].args[0], commands[i].args);
 
+            // exec failed: 127 = command not found, 126 = cannot execute
             perror(commands[i].args[0]);
-            _exit(EXIT_FAILURE);
+            _exit(errno == ENOENT ? 127 : 126);
         }
 
         pids[i] = pid;
@@ -552,20 +581,38 @@ static int execute_pipeline(
             }
         }
 
+        last_exit_status = 0;
         return 0;
     }
 
-    // Foreground execution: wait for every child
+    // Foreground execution: wait for every child.
+    // The exit status of the pipeline is the status of its last command.
     for (int i = 0; i < command_count; i++) {
 
-        while (waitpid(pids[i], NULL, 0) == -1) {
+        int status = 0;
+
+        while (waitpid(pids[i], &status, 0) == -1) {
 
             if (errno == EINTR) {
                 continue;
             }
 
             perror("waitpid");
+            status = 1 << 8;
             break;
+        }
+
+        if (i == command_count - 1) {
+
+            if (WIFEXITED(status)) {
+                last_exit_status = WEXITSTATUS(status);
+            }
+            else if (WIFSIGNALED(status)) {
+                last_exit_status = 128 + WTERMSIG(status);
+            }
+            else {
+                last_exit_status = 1;
+            }
         }
     }
 
@@ -578,9 +625,19 @@ static int execute_single_command(char* line) {
 
     char* tokens[MAX_TOKENS];
 
+    // Ignore comment lines
+    if (line[0] == '#') {
+        return 0;
+    }
+
     int token_count = parse_tokens(line, tokens);
 
-    if (token_count <= 0) {
+    if (token_count < 0) {
+        last_exit_status = 2;
+        return 0;
+    }
+
+    if (token_count == 0) {
         return 0;
     }
 
@@ -596,6 +653,7 @@ static int execute_single_command(char* line) {
 
                 fprintf(stderr, "Syntax error: & must be at the end\n");
                 free_tokens(tokens, token_count);
+                last_exit_status = 2;
                 return 0;
             }
 
@@ -610,6 +668,7 @@ static int execute_single_command(char* line) {
 
     if (token_count == 0) {
         fprintf(stderr, "Syntax error: missing command\n");
+        last_exit_status = 2;
         return 0;
     }
 
@@ -625,6 +684,7 @@ static int execute_single_command(char* line) {
         ) != 0) {
 
         free_tokens(tokens, token_count);
+        last_exit_status = 2;
         return 0;
     }
 
@@ -714,6 +774,265 @@ int execute_line(char* line) {
 
             quote = *p;
         }
+    }
+
+    return 0;
+}
+
+
+
+// =====================================================================
+// Feature 7: if-then-else-fi
+// =====================================================================
+
+// Skip leading whitespace
+static const char* skip_spaces(const char* text) {
+
+    while (*text != '\0' && isspace((unsigned char)*text)) {
+        text++;
+    }
+
+    return text;
+}
+
+
+// Return 1 if the first word of the line is "if"
+int is_if_line(const char* line) {
+
+    const char* p = skip_spaces(line);
+
+    return strncmp(p, "if", 2) == 0 &&
+           (p[2] == '\0' || isspace((unsigned char)p[2]));
+}
+
+
+// Return 1 if the line contains only the given keyword
+static int is_keyword_line(const char* line, const char* keyword) {
+
+    const char* p = skip_spaces(line);
+    size_t length = strlen(keyword);
+
+    if (strncmp(p, keyword, length) != 0) {
+        return 0;
+    }
+
+    return *skip_spaces(p + length) == '\0';
+}
+
+
+// Return 1 if the line is only "fi"
+int is_fi_line(const char* line) {
+    return is_keyword_line(line, "fi");
+}
+
+
+// Find the then / else / fi lines that belong to the if at lines[start].
+// Nested if blocks are skipped. Returns 0 on success, -1 on syntax error.
+static int find_if_structure(
+    char** lines,
+    int start,
+    int count,
+    int inline_then,
+    int* then_index,
+    int* else_index,
+    int* fi_index
+) {
+
+    int depth = 1;
+
+    *then_index = inline_then ? start : -1;
+    *else_index = -1;
+    *fi_index = -1;
+
+    for (int j = start + 1; j < count; j++) {
+
+        if (is_if_line(lines[j])) {
+            depth++;
+            continue;
+        }
+
+        if (is_fi_line(lines[j])) {
+
+            depth--;
+
+            if (depth == 0) {
+                *fi_index = j;
+                break;
+            }
+
+            continue;
+        }
+
+        if (depth != 1) {
+            continue;
+        }
+
+        if (is_keyword_line(lines[j], "then") && *then_index == -1) {
+            *then_index = j;
+        }
+        else if (is_keyword_line(lines[j], "else") &&
+                 *then_index != -1 &&
+                 *else_index == -1) {
+            *else_index = j;
+        }
+    }
+
+    if (*fi_index == -1) {
+        fprintf(stderr, "Syntax error: missing 'fi'\n");
+        return -1;
+    }
+
+    if (*then_index == -1 || (!inline_then && *then_index != start + 1)) {
+        fprintf(stderr, "Syntax error: expected 'then' after 'if'\n");
+        return -1;
+    }
+
+    return 0;
+}
+
+
+// Execute an array of lines, handling if blocks recursively
+int execute_block(char** lines, int count) {
+
+    int i = 0;
+
+    while (i < count) {
+
+        // Stray keywords outside an if block
+        if (is_keyword_line(lines[i], "then") ||
+            is_keyword_line(lines[i], "else") ||
+            is_keyword_line(lines[i], "fi")) {
+
+            fprintf(
+                stderr,
+                "Syntax error near unexpected token '%s'\n",
+                skip_spaces(lines[i])
+            );
+
+            last_exit_status = 2;
+            return 0;
+        }
+
+        // Ordinary command line
+        if (!is_if_line(lines[i])) {
+
+            char* copy = strdup(lines[i]);
+
+            if (copy == NULL) {
+                perror("strdup");
+                return 0;
+            }
+
+            int result = execute_line(copy);
+            free(copy);
+
+            if (result == 2) {
+                return 2;
+            }
+
+            i++;
+            continue;
+        }
+
+        // ---- if block ----
+
+        // Condition text: everything after the word "if"
+        char* condition = strdup(skip_spaces(lines[i]) + 2);
+
+        if (condition == NULL) {
+            perror("strdup");
+            return 0;
+        }
+
+        // Support "if command; then" on a single line
+        int inline_then = 0;
+        size_t length = strlen(condition);
+
+        while (length > 0 && isspace((unsigned char)condition[length - 1])) {
+            condition[--length] = '\0';
+        }
+
+        if (length >= 4 && strcmp(condition + length - 4, "then") == 0) {
+
+            size_t k = length - 4;
+
+            while (k > 0 && isspace((unsigned char)condition[k - 1])) {
+                k--;
+            }
+
+            if (k > 0 && condition[k - 1] == ';') {
+                condition[k - 1] = '\0';
+                inline_then = 1;
+            }
+        }
+
+        if (*skip_spaces(condition) == '\0') {
+            fprintf(stderr, "Syntax error: missing condition after 'if'\n");
+            free(condition);
+            last_exit_status = 2;
+            return 0;
+        }
+
+        int then_index, else_index, fi_index;
+
+        if (find_if_structure(
+                lines,
+                i,
+                count,
+                inline_then,
+                &then_index,
+                &else_index,
+                &fi_index
+            ) != 0) {
+
+            free(condition);
+            last_exit_status = 2;
+            return 0;
+        }
+
+        // Run the condition and read its exit status
+        int result = execute_line(condition);
+        free(condition);
+
+        if (result == 2) {
+            return 2;
+        }
+
+        int condition_status = get_last_exit_status();
+
+        // Select the block to run
+        int block_start;
+        int block_end;
+
+        if (condition_status == 0) {
+
+            // then block: after "then" up to "else" (or "fi")
+            block_start = then_index + 1;
+            block_end = (else_index != -1) ? else_index : fi_index;
+        }
+        else if (else_index != -1) {
+
+            // else block: after "else" up to "fi"
+            block_start = else_index + 1;
+            block_end = fi_index;
+        }
+        else {
+
+            // No else block: nothing to run
+            block_start = block_end = fi_index;
+        }
+
+        if (block_end > block_start) {
+
+            result = execute_block(lines + block_start, block_end - block_start);
+
+            if (result == 2) {
+                return 2;
+            }
+        }
+
+        // Continue after the matching "fi"
+        i = fi_index + 1;
     }
 
     return 0;
