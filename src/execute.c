@@ -39,6 +39,275 @@ int get_last_exit_status(void) {
 }
 
 
+// =====================================================================
+// Feature 8: shell variables
+// =====================================================================
+
+#define MAX_VAR_NAME 64
+
+// One shell variable (singly linked list node)
+typedef struct Variable {
+    char* name;
+    char* value;
+    struct Variable* next;
+} Variable;
+
+
+// Head of the variable list (variables stay in creation order)
+static Variable* variable_list = NULL;
+
+
+// Return 1 if the text is a valid variable name: [A-Za-z_][A-Za-z0-9_]*
+static int is_valid_name(const char* name) {
+
+    if (!(isalpha((unsigned char)name[0]) || name[0] == '_')) {
+        return 0;
+    }
+
+    for (int i = 1; name[i] != '\0'; i++) {
+
+        if (!(isalnum((unsigned char)name[i]) || name[i] == '_')) {
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+
+// Find a variable by name, or NULL
+static Variable* find_variable(const char* name) {
+
+    for (Variable* v = variable_list; v != NULL; v = v->next) {
+
+        if (strcmp(v->name, name) == 0) {
+            return v;
+        }
+    }
+
+    return NULL;
+}
+
+
+// Value of a variable. Shell variables are checked first,
+// then environment variables (such as HOME). Returns NULL if undefined.
+static const char* lookup_variable_value(const char* name) {
+
+    Variable* v = find_variable(name);
+
+    if (v != NULL) {
+        return v->value;
+    }
+
+    return getenv(name);
+}
+
+
+// Create a variable or update an existing one. Returns 0 on success.
+static int set_variable(const char* name, const char* value) {
+
+    char* value_copy = strdup(value);
+
+    if (value_copy == NULL) {
+        perror("strdup");
+        return -1;
+    }
+
+    Variable* existing = find_variable(name);
+
+    // Re-assignment: replace the old value
+    if (existing != NULL) {
+        free(existing->value);
+        existing->value = value_copy;
+        return 0;
+    }
+
+    // New variable: allocate a node and append it to the list
+    Variable* node = malloc(sizeof(Variable));
+
+    if (node == NULL) {
+        perror("malloc");
+        free(value_copy);
+        return -1;
+    }
+
+    node->name = strdup(name);
+
+    if (node->name == NULL) {
+        perror("strdup");
+        free(value_copy);
+        free(node);
+        return -1;
+    }
+
+    node->value = value_copy;
+    node->next = NULL;
+
+    if (variable_list == NULL) {
+        variable_list = node;
+    }
+    else {
+
+        Variable* tail = variable_list;
+
+        while (tail->next != NULL) {
+            tail = tail->next;
+        }
+
+        tail->next = node;
+    }
+
+    return 0;
+}
+
+
+// Print all shell variables (used by the set built-in)
+static void print_variables(void) {
+
+    if (variable_list == NULL) {
+        printf("No shell variables defined.\n");
+        return;
+    }
+
+    for (Variable* v = variable_list; v != NULL; v = v->next) {
+        printf("%s=%s\n", v->name, v->value);
+    }
+}
+
+
+// Return 1 if the word looks like NAME=value
+static int is_assignment(const char* word) {
+
+    if (!(isalpha((unsigned char)word[0]) || word[0] == '_')) {
+        return 0;
+    }
+
+    int i = 1;
+
+    while (isalnum((unsigned char)word[i]) || word[i] == '_') {
+        i++;
+    }
+
+    return word[i] == '=';
+}
+
+
+// Store NAME=value (the word has already been checked by is_assignment)
+static void perform_assignment(const char* word) {
+
+    const char* equals = strchr(word, '=');
+    size_t name_length = (size_t)(equals - word);
+
+    char name[MAX_VAR_NAME + 1];
+
+    if (name_length > MAX_VAR_NAME) {
+        fprintf(stderr, "Variable name too long\n");
+        last_exit_status = 1;
+        return;
+    }
+
+    memcpy(name, word, name_length);
+    name[name_length] = '\0';
+
+    if (set_variable(name, equals + 1) == 0) {
+        last_exit_status = 0;
+    }
+    else {
+        last_exit_status = 1;
+    }
+}
+
+
+// Append text to the argument buffer. Returns 0 on success.
+static int append_text(char* buffer, int* length, const char* text) {
+
+    size_t text_length = strlen(text);
+
+    if ((size_t)*length + text_length >= MAX_LEN) {
+        fprintf(stderr, "Argument too long\n");
+        return -1;
+    }
+
+    memcpy(buffer + *length, text, text_length);
+    *length += (int)text_length;
+
+    return 0;
+}
+
+
+// Expand one variable reference. *cursor points at the '$' character and
+// is advanced past the reference. The value is appended to buffer.
+// Supported forms: $NAME, ${NAME}, $?
+static int expand_variable(char* buffer, int* length, char** cursor) {
+
+    char* p = *cursor + 1;
+    char name[MAX_VAR_NAME + 1];
+    char number[16];
+    const char* value = NULL;
+
+    if (*p == '?') {
+
+        snprintf(number, sizeof(number), "%d", last_exit_status);
+        value = number;
+        p++;
+    }
+    else if (*p == '{') {
+
+        char* close_brace = strchr(p, '}');
+
+        if (close_brace == NULL) {
+            fprintf(stderr, "Syntax error: missing '}'\n");
+            return -1;
+        }
+
+        size_t name_length = (size_t)(close_brace - (p + 1));
+
+        if (name_length == 0 || name_length > MAX_VAR_NAME) {
+            fprintf(stderr, "Syntax error: bad variable name\n");
+            return -1;
+        }
+
+        memcpy(name, p + 1, name_length);
+        name[name_length] = '\0';
+
+        if (!is_valid_name(name)) {
+            fprintf(stderr, "Syntax error: bad variable name\n");
+            return -1;
+        }
+
+        value = lookup_variable_value(name);
+        p = close_brace + 1;
+    }
+    else if (isalpha((unsigned char)*p) || *p == '_') {
+
+        size_t name_length = 0;
+
+        while (isalnum((unsigned char)*p) || *p == '_') {
+
+            if (name_length < MAX_VAR_NAME) {
+                name[name_length++] = *p;
+            }
+
+            p++;
+        }
+
+        name[name_length] = '\0';
+        value = lookup_variable_value(name);
+    }
+    else {
+
+        // A lone '$' is kept as a normal character
+        *cursor = p;
+        return append_text(buffer, length, "$");
+    }
+
+    *cursor = p;
+
+    // Undefined variables expand to an empty string
+    return append_text(buffer, length, value != NULL ? value : "");
+}
+
+
 // Remove a completed process from the active jobs list
 static void remove_background_job(pid_t pid) {
 
@@ -211,6 +480,13 @@ int handle_builtin(char** arglist) {
         return 1;
     }
 
+    // SET: display all shell variables
+    if (strcmp(arglist[0], "set") == 0) {
+        print_variables();
+        last_exit_status = 0;
+        return 1;
+    }
+
     return 0;
 }
 
@@ -230,8 +506,20 @@ void print_history(void) {
 }
 
 
+// Free token memory
+static void free_tokens(char* tokens[], int count) {
+
+    for (int i = 0; i < count; i++) {
+        free(tokens[i]);
+    }
+}
+
+
 // Split a line into words and operators.
-// Supports single and double quoted arguments.
+// - Single and double quotes may appear anywhere inside a word
+//   (for example MSG="Hello, World!").
+// - $NAME, ${NAME} and $? are expanded here, except inside single quotes.
+// Returns the token count, or -1 on error (tokens are freed on error).
 static int parse_tokens(char* line, char* tokens[]) {
 
     int count = 0;
@@ -249,6 +537,7 @@ static int parse_tokens(char* line, char* tokens[]) {
 
         if (count >= MAX_TOKENS) {
             fprintf(stderr, "Too many tokens\n");
+            free_tokens(tokens, count);
             return -1;
         }
 
@@ -260,6 +549,7 @@ static int parse_tokens(char* line, char* tokens[]) {
 
             if (tokens[count] == NULL) {
                 perror("strdup");
+                free_tokens(tokens, count);
                 return -1;
             }
 
@@ -268,36 +558,52 @@ static int parse_tokens(char* line, char* tokens[]) {
             continue;
         }
 
-        // Read a normal or quoted argument
+        // Read one word (quotes and variables are processed as we go)
         char buffer[MAX_LEN];
         int length = 0;
         char quote = '\0';
-
-        if (*p == '\'' || *p == '"') {
-            quote = *p;
-            p++;
-        }
+        int has_word = 0;       // set by quotes so "" gives an empty argument
 
         while (*p != '\0') {
 
-            if (quote != '\0') {
+            if (quote == '\0') {
 
-                if (*p == quote) {
-                    p++;
-                    quote = '\0';
-                    break;
-                }
-            }
-            else {
-
+                // An unquoted space or operator ends the word
                 if (isspace((unsigned char)*p) ||
                     *p == '|' || *p == '<' || *p == '>' || *p == '&') {
                     break;
                 }
+
+                // Opening quote
+                if (*p == '\'' || *p == '"') {
+                    quote = *p;
+                    has_word = 1;
+                    p++;
+                    continue;
+                }
+            }
+            else if (*p == quote) {
+
+                // Closing quote
+                quote = '\0';
+                p++;
+                continue;
+            }
+
+            // Variable expansion (not inside single quotes)
+            if (*p == '$' && quote != '\'') {
+
+                if (expand_variable(buffer, &length, &p) != 0) {
+                    free_tokens(tokens, count);
+                    return -1;
+                }
+
+                continue;
             }
 
             if (length >= MAX_LEN - 1) {
                 fprintf(stderr, "Argument too long\n");
+                free_tokens(tokens, count);
                 return -1;
             }
 
@@ -307,12 +613,14 @@ static int parse_tokens(char* line, char* tokens[]) {
 
         if (quote != '\0') {
             fprintf(stderr, "Syntax error: unmatched quote\n");
+            free_tokens(tokens, count);
             return -1;
         }
 
         buffer[length] = '\0';
 
-        if (length == 0) {
+        // An unquoted variable that expanded to nothing disappears
+        if (length == 0 && !has_word) {
             continue;
         }
 
@@ -320,6 +628,7 @@ static int parse_tokens(char* line, char* tokens[]) {
 
         if (tokens[count] == NULL) {
             perror("strdup");
+            free_tokens(tokens, count);
             return -1;
         }
 
@@ -327,15 +636,6 @@ static int parse_tokens(char* line, char* tokens[]) {
     }
 
     return count;
-}
-
-
-// Free token memory
-static void free_tokens(char* tokens[], int count) {
-
-    for (int i = 0; i < count; i++) {
-        free(tokens[i]);
-    }
 }
 
 
@@ -689,6 +989,20 @@ static int execute_single_command(char* line) {
     }
 
     int result = 0;
+
+    // Variable assignment (NAME=value) is handled by the shell itself,
+    // without fork(), because the variable must live in the shell process
+    if (!background &&
+        command_count == 1 &&
+        commands[0].argc == 1 &&
+        commands[0].input_file == NULL &&
+        commands[0].output_file == NULL &&
+        is_assignment(commands[0].args[0])) {
+
+        perform_assignment(commands[0].args[0]);
+        free_tokens(tokens, token_count);
+        return 0;
+    }
 
     // Built-ins execute in the parent shell when run in foreground
     if (!background &&
